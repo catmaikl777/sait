@@ -72,6 +72,8 @@
   let analyser = null;
   let visualizationBars = [];
   let visualizationInterval = null;
+  // Хранилище живых audio-объектов, чтобы можно было останавливать воспроизведение
+  const audioInstances = new Map();
   const iceRestartTimers = new Map();
   const lastIceRestartAt = new Map();
   const offerInProgress = new Set();
@@ -567,8 +569,7 @@
         console.warn("⚠️ No specific format supported, using default");
       }
 
-      // Создаем MediaRecorder с обработкой ошибок
-      let mediaRecorder;
+      // Создаем MediaRecorder с обработкой ошибок (используем глобальную переменную)
       try {
         mediaRecorder = new MediaRecorder(stream, {
           mimeType: supportedType,
@@ -918,16 +919,23 @@
 
       audio.volume = 0.8;
 
-      // Останавливаем все другие воспроизведения
+      // Останавливаем все другие воспроизведения (используем Map для хранения экземпляров Audio)
       document.querySelectorAll(".play-pause-btn").forEach((btn) => {
-        if (btn !== button && btn.getAttribute("data-audio-instance")) {
-          const otherAudio = btn.getAttribute("data-audio-instance");
+        if (btn === button) return;
+        const otherId = btn.dataset.audioId;
+        if (otherId) {
+          const otherAudio = audioInstances.get(otherId);
           try {
-            otherAudio.pause();
-            otherAudio.currentTime = 0;
-          } catch (e) {}
+            if (otherAudio && typeof otherAudio.pause === "function") {
+              otherAudio.pause();
+              otherAudio.currentTime = 0;
+            }
+          } catch (e) {
+            console.warn("Error stopping other audio:", e);
+          }
           btn.textContent = "▶️";
-          btn.removeAttribute("data-audio-instance");
+          delete btn.dataset.audioId;
+          audioInstances.delete(otherId);
 
           const otherBars = btn.parentElement.querySelectorAll(".voice-bar");
           const otherProgress = btn.parentElement.parentElement.querySelector(
@@ -937,12 +945,20 @@
         }
       });
 
-      if (button.getAttribute("data-audio-instance")) {
-        // Останавливаем текущее воспроизведение
-        const currentAudio = button.getAttribute("data-audio-instance");
-        currentAudio.pause();
+      const existingId = button.dataset.audioId;
+      if (existingId) {
+        // Останавливаем текущее воспроизведение для этой кнопки
+        const currentAudio = audioInstances.get(existingId);
+        try {
+          if (currentAudio && typeof currentAudio.pause === "function") {
+            currentAudio.pause();
+          }
+        } catch (e) {
+          console.warn("Error pausing current audio:", e);
+        }
         button.textContent = "▶️";
-        button.removeAttribute("data-audio-instance");
+        delete button.dataset.audioId;
+        audioInstances.delete(existingId);
 
         const bars = button.parentElement.querySelectorAll(".voice-bar");
         const progressBar = button.parentElement.parentElement.querySelector(
@@ -952,7 +968,10 @@
       } else {
         // Начинаем воспроизведение
         button.textContent = "⏸️";
-        button.setAttribute("data-audio-instance", audio);
+  // Присваиваем уникальный id и сохраняем объект Audio в Map
+  const audioId = `audio_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+  button.dataset.audioId = audioId;
+  audioInstances.set(audioId, audio);
 
         const visualization = button.parentElement.querySelector(
           ".voice-visualization"
@@ -971,7 +990,11 @@
 
         audio.addEventListener("ended", () => {
           button.textContent = "▶️";
-          button.removeAttribute("data-audio-instance");
+          const id = button.dataset.audioId;
+          if (id) {
+            audioInstances.delete(id);
+            delete button.dataset.audioId;
+          }
           resetVisualization(bars, progressBar);
           if (progressBar) {
             progressBar.style.width = "0%";
@@ -981,7 +1004,11 @@
         audio.addEventListener("error", (e) => {
           console.error("❌ Audio playback error:", e);
           button.textContent = "▶️";
-          button.removeAttribute("data-audio-instance");
+          const id = button.dataset.audioId;
+          if (id) {
+            audioInstances.delete(id);
+            delete button.dataset.audioId;
+          }
           resetVisualization(bars, progressBar);
           showSystemMessage("❌ Ошибка воспроизведения аудио");
 
@@ -1013,7 +1040,11 @@
             .catch((error) => {
               console.error("❌ Audio play failed:", error);
               button.textContent = "▶️";
-              button.removeAttribute("data-audio-instance");
+              const id = button.dataset.audioId;
+              if (id) {
+                audioInstances.delete(id);
+                delete button.dataset.audioId;
+              }
 
               if (error.name === "NotAllowedError") {
                 showSystemMessage(
@@ -2064,6 +2095,12 @@
         localVideo.srcObject = localStream;
         // Включаем звук для локального видео (для тестирования)
         localVideo.muted = true; // Локальное видео обычно без звука
+        // Отключаем зеркалирование локального видео (убираем CSS трансформацию)
+        try {
+          localVideo.style.transform = "none";
+          localVideo.style.webkitTransform = "none";
+          localVideo.style.msTransform = "none";
+        } catch (e) {}
       }
 
       console.log("✅ Local stream initialized successfully with audio");
@@ -2287,6 +2324,12 @@
       try {
         remoteVideo.srcObject = remoteStream;
         console.log(`✅ Remote video stream set for ${sessionId}`);
+        // Убедимся, что удалённое видео не зеркалится
+        try {
+          remoteVideo.style.transform = "none";
+          remoteVideo.style.webkitTransform = "none";
+          remoteVideo.style.msTransform = "none";
+        } catch (e) {}
       } catch (error) {
         console.error(`❌ Error setting remote video for ${sessionId}:`, error);
       }
@@ -3359,10 +3402,24 @@
 
   // Обработка закрытия страницы
   window.addEventListener("beforeunload", () => {
-    if (ws) {
-      ws.close(1000, "Page closed");
+    try {
+      // Попробуем корректно уведомить сервер о выходе
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: "leave" }));
+        } catch (e) {
+          // ignore
+        }
+        // Небольшая задержка не гарантирована в beforeunload, но посылаем close
+        ws.close(1000, "Page closed");
+      }
+    } catch (e) {
+      console.warn("Error during beforeunload leave flow:", e);
     }
-    endCall();
+
+    try {
+      endCall();
+    } catch (e) {}
   });
 
   // Автоматический мониторинг соединений
@@ -3460,8 +3517,8 @@
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       if (stream) {
         // Если доступ есть, начинаем запись
-        if (window.startVoiceRecording) {
-          window.startVoiceRecording();
+        if (typeof startVoiceRecording === "function") {
+          startVoiceRecording();
         }
       } else {
         showSystemMessage("❌ Не удалось получить доступ к микрофону");
@@ -3479,38 +3536,38 @@
   };
 
   window.startVideoCall = function () {
-    if (window.startGroupCall) {
-      window.startGroupCall();
+    if (typeof startGroupCall === "function") {
+      startGroupCall();
     }
   };
 
   window.endVideoCall = function () {
-    if (window.endCall) {
-      window.endCall();
+    if (typeof endCall === "function") {
+      endCall();
     }
   };
 
   window.acceptVideoCall = function () {
-    if (window.acceptCall) {
-      window.acceptCall();
+    if (typeof acceptCall === "function") {
+      acceptCall();
     }
   };
 
   window.rejectVideoCall = function () {
-    if (window.rejectCall) {
-      window.rejectCall();
+    if (typeof rejectCall === "function") {
+      rejectCall();
     }
   };
 
   window.toggleVideo = function () {
-    if (window.toggleVideo) {
-      window.toggleVideo();
+    if (typeof toggleVideo === "function") {
+      toggleVideo();
     }
   };
 
   window.toggleAudio = function () {
-    if (window.toggleAudio) {
-      window.toggleAudio();
+    if (typeof toggleAudio === "function") {
+      toggleAudio();
     }
   };
 
@@ -3520,14 +3577,14 @@
   };
 
   window.stopVoiceRecording = function () {
-    if (window.stopVoiceRecording) {
-      window.stopVoiceRecording();
+    if (typeof stopVoiceRecording === "function") {
+      stopVoiceRecording();
     }
   };
 
   window.cancelVoiceRecording = function () {
-    if (window.cancelVoiceRecording) {
-      window.cancelVoiceRecording();
+    if (typeof cancelVoiceRecording === "function") {
+      cancelVoiceRecording();
     }
   };
 

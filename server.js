@@ -902,6 +902,21 @@ wss.on("connection", async (ws, req) => {
           }
           break;
 
+        case "leave":
+          try {
+            // Помечаем сессию как завершённую в БД
+            await db.endUserSession(sessionId);
+
+            if (currentUser) {
+              await db.saveMessage(userId, "system", `${currentUser.username} вышел из чата`);
+              broadcast({ type: "system", text: `🐱 ${currentUser.username} вышел из чата` });
+              await broadcastUsers();
+            }
+          } catch (error) {
+            console.error("Error handling leave message:", error);
+          }
+          break;
+
         case "private":
           if (message.to && message.text && message.text.trim()) {
             const targetUser = await db.getUserById(message.to);
